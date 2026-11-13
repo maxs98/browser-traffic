@@ -97,6 +97,8 @@ npx playwright install chromium
 | `--max-rate <Mbps>` | 不限 | 限制平均速率上限，避免持续跑满带宽（**推荐设置**） |
 | `--video-seconds <a-b>` | 8-25 | 每页视频播放时长区间 |
 | `--no-video` | 关 | 关闭自动播放页面视频 |
+| `--screenshot <目录>` | 关 | 视频起播 2 秒后自动截图，用来确认画面真的在动 |
+| `--url <网址>` | 关 | 直接指定页面浏览（可多次），用于测试具体播放页 |
 | `--headed` | 关 | 显示浏览器窗口（默认无头运行） |
 | `--audio` | 关 | 允许播放声音（默认静音） |
 
@@ -117,13 +119,18 @@ npx playwright install chromium
 ```bash
 ./cnbrowse -c video --video-seconds 15-40      # 只逛视频站，每页看 15~40 秒
 ./cnbrowse --no-video                          # 只要图文流量
+
+# 直接测某个播放页，并截图确认画面
+./cnbrowse --url https://www.bilibili.com/video/BV1GJ411x7h7 \
+  --headed --video-seconds 20-30 --screenshot /tmp/shots
 ```
 
 实测：爱奇艺首页播 7 秒、斗鱼直播播 10 秒都能正常起播并产生媒体流量；
 汇总里会出现「含视频页」以及每页的「播放期间拉流」字节数。
 
-> 说明：部分站点首页的 `<video>` 只是预览小窗，真正的大流量出现在详情页，
-> 配合默认的 `--depth 1` 效果更明显。直播站若走 WebSocket 传流，字节数按 WebSocket 帧计入。
+> 说明：不少站点首页的 `<video>` 是**隐藏的预加载/悬停预览**，页面上根本没有可见播放器，
+> 这时会打印 `⚠ 播放器不在视口内`。想看真实播放效果，请用 `--url` 指向具体的播放页，
+> 或配合 `--depth 1` 进入详情页。直播站若走 WebSocket 传流，字节数按 WebSocket 帧计入。
 
 ### 其它
 

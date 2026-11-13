@@ -351,8 +351,9 @@ class Browser {
       '--disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion',
       '--window-size=1512,945',
       '--lang=zh-CN', '--accept-lang=zh-CN,zh;q=0.9,en;q=0.8',
-      '--disable-gpu', '--disable-dev-shm-usage', '--disable-software-rasterizer',
-      '--autoplay-policy=no-user-gesture-required',
+      '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
+      // 无头模式才禁用 GPU；有头模式下禁用 GPU 会让视频渲染成黑屏
+      ...(this.opts.headed ? [] : ['--disable-gpu', '--disable-software-rasterizer']),
       '--disable-ipc-flooding-protection',
       ...(this.opts.headed ? [] : ['--headless=new']),
       ...(this.opts.audio ? [] : ['--mute-audio']),
@@ -650,6 +651,21 @@ class Page {
     } catch { return ''; }
   }
 
+  /** 抓一张当前视口截图（用于确认画面真的在动） */
+  async screenshot(dir, tag = 'shot') {
+    try {
+      const { data } = await this.cdp.send('Page.captureScreenshot', { format: 'png' }, this.S);
+      if (!data) return null;
+      mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const file = join(dir, `${stamp}-${tag}.png`);
+      writeFileSync(file, Buffer.from(data, 'base64'));
+      return file;
+    } catch (e) {
+      return null;
+    }
+  }
+
   /** 触发页面内的延迟请求（滚动、hover、点击"加载更多"） */
   async stimulate() {
     // 尝试点掉可能的弹窗/遮罩（常见于门户站）
@@ -682,6 +698,11 @@ class Page {
       const out = [];
       for (const v of document.querySelectorAll('video')) {
         const r = v.getBoundingClientRect();
+        const cs = getComputedStyle(v);
+        const vis = cs.display !== 'none' && cs.visibility !== 'hidden' &&
+                    parseFloat(cs.opacity || '1') > 0.05;
+        const inView = r.bottom > 0 && r.top < innerHeight &&
+                       r.right > 0 && r.left < innerWidth;
         out.push({
           src: String(v.currentSrc || v.src || '').slice(0, 160),
           dur: Number.isFinite(v.duration) ? Math.round(v.duration) : 0,
@@ -689,6 +710,7 @@ class Page {
           paused: !!v.paused,
           rs: v.readyState || 0,
           area: Math.round((r.width || 0) * (r.height || 0)),
+          vis, inView,
         });
       }
       return out;
@@ -711,17 +733,29 @@ class Page {
     const bytesBefore = this.bytes;
     const found = await this.probeVideos();
     if (!found.length) return { played: false, reason: 'no-video' };
-    const best = found.sort((a, b) => (b.vids[0]?.area || 0) - (a.vids[0]?.area || 0))[0];
+    // 优先挑选"真的看得见"的视频：可见 > 在视口内 > 面积大
+    const score = (v) => (v.vis ? 1e10 : 0) + (v.inView ? 1e9 : 0) + (v.area || 0);
+    const ranked = found
+      .map((c) => ({ ...c, best: [...c.vids].sort((x, y) => score(y) - score(x))[0] }))
+      .sort((a, b) => score(b.best) - score(a.best));
+    const best = ranked[0];
+    const visible = !!(best.best && best.best.vis);
     const ctxId = best.ctxId;
 
     const startScript = `(async () => {
       const vs = [...document.querySelectorAll('video')];
       if (!vs.length) return { ok: false };
-      vs.sort((a, b) => {
-        const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
-        return (br.width * br.height) - (ar.width * ar.height);
-      });
+      const sc = (v) => {
+        const r = v.getBoundingClientRect(), cs = getComputedStyle(v);
+        const vis = cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity || '1') > 0.05;
+        const inView = r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+        return (vis ? 1e10 : 0) + (inView ? 1e9 : 0) + (r.width * r.height);
+      };
+      vs.sort((a, b) => sc(b) - sc(a));
       const v = vs[0];
+      // 把播放器滚到视口中央，确保人眼能看到画面
+      try { v.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+      await new Promise((r) => setTimeout(r, 350));
       v.muted = true; v.volume = 0;
       try { v.play(); } catch (e) {}
       if (v.paused) {
@@ -747,6 +781,7 @@ class Page {
     const limitMs = Math.max(3, maxSeconds) * 1000;
     const t0 = Date.now();
     let lastT = null, advanced = 0, dur = best.vids[0]?.dur || 0;
+    let shotTaken = false, onScreen = null;
     while (Date.now() - t0 < limitMs) {
       if (this.crashed) break;
       await sleep(1000);
@@ -756,12 +791,32 @@ class Page {
       if (lastT !== null && st.t > lastT) advanced += st.t - lastT;
       lastT = st.t;
       if (st.dur > 0) dur = st.dur;
+      // 起播 2 秒后抓一张图，方便确认画面是否真的在动
+      if (advanced >= 2 && !shotTaken) {
+        shotTaken = true;
+        // 记录播放器是否真的落在视口里（有些站点只是隐藏的预加载 <video>）
+        try {
+          const pos = await this.evaluate(`(() => {
+            const v = document.querySelector('video');
+            if (!v) return null;
+            const r = v.getBoundingClientRect();
+            return { w: Math.round(r.width), h: Math.round(r.height),
+                     onScreen: r.bottom > 0 && r.top < innerHeight && r.right > 0 &&
+                               r.left < innerWidth && r.width > 40 && r.height > 40 };
+          })()`, false, 3000, ctxId);
+          onScreen = !!(pos && pos.onScreen);
+        } catch { onScreen = null; }
+        if (this.b?.opts?.screenshots) {
+          await this.screenshot(this.b.opts.screenshots, 'video').catch(() => {});
+        }
+      }
       if (st.ended) break;
     }
     const secs = (Date.now() - t0) / 1000;
     return {
       played: advanced >= 1, advanced: Math.round(advanced), seconds: Math.round(secs),
       duration: Math.round(dur), bytes: this.bytes - bytesBefore,
+      visible, onScreen, area: best.best?.area || 0,
     };
   }
 
@@ -884,7 +939,7 @@ function parseArgs(argv) {
     profile: join(homedir(), '.config', 'cnbrowse', 'browser-profile'),
     statsFile: '', chrome: '', port: 0, seed: '', heavyOnly: false, verbose: false,
     concurrency: 1, maxRate: 0, noImage: false, saveFailed: false, targetBytes: 0,
-    video: true, videoSeconds: [8, 25],
+    video: true, videoSeconds: [8, 25], screenshots: '', urls: [],
   };
   const a = argv.slice();
   const need = (i, k) => { if (i + 1 >= a.length) throw new Error(`${k} 需要一个参数`); return a[i + 1]; };
@@ -906,6 +961,8 @@ function parseArgs(argv) {
       case '--max-rate': o.maxRate = parseFloat(need(i, k)) * 1e6; i++; break;
       case '--target-traffic': o.targetBytes = parseSize(need(i, k)); i++; break;
       case '--no-video': o.video = false; break;
+      case '--screenshot': o.screenshots = need(i, k); i++; break;
+      case '--url': o.urls.push(need(i, k)); i++; break;
       case '--video-seconds': {
         const v = need(i, k).split('-').map(Number);
         o.videoSeconds = [v[0] || 8, v[1] ?? v[0] ?? 25];
@@ -954,6 +1011,8 @@ cnbrowse —— 用真实浏览器随机浏览国内网站，产生与真人上�
       --max-rate <Mbps>   限制平均速率上限（默认不限）
       --no-video          不自动播放页面里的视频（默认会播）
       --video-seconds <a-b>  每页视频播放时长区间（默认 8-25 秒）
+      --screenshot <目录>  视频起播 2 秒后自动截图，用于确认画面在动
+      --url <网址>        直接指定要浏览的页面（可多次；用于测试某个具体播放页）
       --profile <目录>    浏览器 profile 目录（保留 Cookie/缓存，默认 ~/.config/cnbrowse/...）
       --stats-file <路径> 持续把统计写入 JSON
       --chrome <路径>     指定 Chrome/Chromium 可执行文件
@@ -967,6 +1026,14 @@ cnbrowse —— 用真实浏览器随机浏览国内网站，产生与真人上�
 
 function resolveSites(o) {
   let pool = SITES.slice();
+  // --url：直接指定页面，忽略内置站点池（便于测试具体播放页）
+  if (o.urls && o.urls.length) {
+    return o.urls.map((u) => {
+      let host = u;
+      try { host = new URL(u).hostname; } catch {}
+      return { n: host, u, c: 'custom', heavy: true };
+    });
+  }
   if (o.heavyOnly) pool = pool.filter((s) => s.heavy);
   if (o.categories.length) {
     const cs = o.categories.map((c) => c.toLowerCase());
@@ -1101,7 +1168,10 @@ class Runner {
     if (r0.video && r0.video.played) {
       this.logln(C.dim(`      ▶ 已播放视频 ${r0.video.advanced}s` +
         `（页面时长 ${r0.video.duration || '直播/?'}s）` +
-        ` 播放期间拉流 ${fmtBytes(r0.video.bytes || 0)}`));
+        ` 播放期间拉流 ${fmtBytes(r0.video.bytes || 0)}` +
+        (r0.video.onScreen === false
+          ? C.yellow('  ⚠ 播放器不在视口内（隐藏的预加载/预览）')
+          : '')));
     }
     this.traffic.absorb(page, site, r0);
     this.traffic.persist();
