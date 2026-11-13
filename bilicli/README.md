@@ -74,6 +74,34 @@ bilicli play BV1xx411c7mD -vol 30              # 音量 30
 bilicli play ep12345                           # 番剧/剧集
 ```
 
+### 自动漫游（连播）
+
+自动获取播放链接，播完一个自动接下一条，适合挂着当"背景播放 + 流量源"。
+
+```bash
+bilicli roam                                  # 从热门开始，一路漫游下去
+bilicli roam BV1GJ411x7h7                     # 从该视频的相关推荐开始漫游
+bilicli roam --source ranking -n 20           # 排行榜连播 20 个
+bilicli roam BV1xx411c7mD --source multi      # 多P 连播
+bilicli roam --source search --keyword 罗翔    # 按搜索词连播
+bilicli roam --source up --mid 123456         # 某个 UP 主的投稿连播
+```
+
+常用开关：
+
+| 选项 | 说明 |
+|---|---|
+| `-n, --count` | 播多少个后停（0=不限） |
+| `--minutes` / `--hours` | 跑多久后停 |
+| `--max-duration` / `--min-duration` | 跳过太长/太短的视频 |
+| `--delay 1-4` | 视频之间停顿秒数区间 |
+| `--shuffle` | 打乱顺序 |
+| `--no-expand` | 不从相关推荐扩张，只用当前来源 |
+| `--save-dir` | 配合 `-m realtime`，把每个视频存到指定目录 |
+
+默认会从当前视频的相关推荐持续扩张，所以只要不设上限就会一直播下去；`Ctrl-C` 随时停止并打印整轮汇总。
+播放失败的视频（失效、付费、无音轨）会自动跳过并继续下一条。
+
 ### 三种流量模式
 
 | 模式 | 说明 | 流量特征 | 用途 |

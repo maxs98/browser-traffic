@@ -5,8 +5,8 @@
 
 | 工具 | 作用 | 技术栈 |
 |---|---|---|
-| [cnbrowse](cnbrowse/README.md) | 用真实 Chrome 内核随机浏览国内网站，产生整页浏览流量 | Node 18+ / CDP，零依赖 |
-| [bilicli](bilicli/README.md) | 命令行看 B 站（不出画面），流量与浏览器看视频一致 | Python 3.8+ / curl_cffi |
+| [cnbrowse](cnbrowse/README.md) | 用真实 Chrome 内核随机浏览国内网站；**遇到视频自动播放**，产生整页 + 媒体流量 | Node 18+ / CDP，零依赖 |
+| [bilicli](bilicli/README.md) | 命令行看 B 站（不出画面），支持**自动漫游连播**；流量与浏览器看视频一致 | Python 3.8+ / curl_cffi |
 
 ## 快速开始
 
@@ -17,8 +17,14 @@
 # 只逛图片/媒体密集的高流量站点，跑 1 小时
 ./cnbrowse/cnbrowse --heavy -t 3600 --max-rate 20
 
+# 只逛视频站，每页播 15~40 秒
+./cnbrowse/cnbrowse -c video --video-seconds 15-40
+
 # 命令行看 B 站，只听声音，后台按真实码率拉视频轨
 ./bilicli/bilicli play BV1GJ411x7h7
+
+# B 站自动漫游：播完一个自动接下一条
+./bilicli/bilicli roam
 ```
 
 ## 安装依赖

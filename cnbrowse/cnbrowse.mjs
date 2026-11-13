@@ -352,6 +352,7 @@ class Browser {
       '--window-size=1512,945',
       '--lang=zh-CN', '--accept-lang=zh-CN,zh;q=0.9,en;q=0.8',
       '--disable-gpu', '--disable-dev-shm-usage', '--disable-software-rasterizer',
+      '--autoplay-policy=no-user-gesture-required',
       '--disable-ipc-flooding-protection',
       ...(this.opts.headed ? [] : ['--headless=new']),
       ...(this.opts.audio ? [] : ['--mute-audio']),
@@ -421,6 +422,8 @@ class Page {
     this.byType = new Map();
     this.failed = 0;
     this._offs = [];
+    // 记录各 frame 的执行上下文，用来在 iframe 里也找 <video>
+    this.contexts = new Map();
     // 真实 UA（覆盖 headless 标记）
     const major = this._chromeMajor();
     this.ua = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
@@ -463,6 +466,28 @@ class Page {
     }, S));
     this._offs.push(this.cdp.on('Network.loadingFailed', (p, sid) => {
       if (sid === S) this.failed++;
+    }, S));
+    // 直播/FLV 走 WebSocket，不属于普通请求，需要单独计入字节
+    this._offs.push(this.cdp.on('Network.webSocketFrameReceived', (p, sid) => {
+      if (sid !== S) return;
+      const n = (p.response && p.response.payloadData || '').length;
+      if (n > 0) {
+        this.bytes += n;
+        this.lastActivity = Date.now();
+        this.byType.set('WebSocket', (this.byType.get('WebSocket') || 0) + n);
+        this.byTypeDelta.set('WebSocket', (this.byTypeDelta.get('WebSocket') || 0) + n);
+      }
+    }, S));
+    this._offs.push(this.cdp.on('Runtime.executionContextCreated', (p, sid) => {
+      if (sid !== S) return;
+      const c = p.context;
+      if (c && c.auxData && c.auxData.isDefault) this.contexts.set(c.id, c.auxData.frameId || '');
+    }, S));
+    this._offs.push(this.cdp.on('Runtime.executionContextDestroyed', (p, sid) => {
+      if (sid === S) this.contexts.delete(p.executionContextId);
+    }, S));
+    this._offs.push(this.cdp.on('Runtime.executionContextsCleared', (_p, sid) => {
+      if (sid === S) this.contexts.clear();
     }, S));
 
     // 弹窗/对话框会阻塞渲染进程，必须自动关掉
@@ -533,9 +558,10 @@ class Page {
     return false;
   }
 
-  async evaluate(expr, awaitPromise = false, timeoutMs = 8000) {
-    const p = this.cdp.send('Runtime.evaluate',
-      { expression: expr, returnByValue: true, awaitPromise }, this.S);
+  async evaluate(expr, awaitPromise = false, timeoutMs = 8000, contextId = undefined) {
+    const params = { expression: expr, returnByValue: true, awaitPromise };
+    if (contextId !== undefined) params.contextId = contextId;
+    const p = this.cdp.send('Runtime.evaluate', params, this.S);
     const v = await Promise.race([
       p,
       new Promise((_, rej) => setTimeout(() => rej(new Error('eval 超时')), timeoutMs)),
@@ -650,6 +676,95 @@ class Page {
     }
   }
 
+  /** 在当前页面（含同源 iframe）里找 <video> */
+  async probeVideos() {
+    const probe = `(() => {
+      const out = [];
+      for (const v of document.querySelectorAll('video')) {
+        const r = v.getBoundingClientRect();
+        out.push({
+          src: String(v.currentSrc || v.src || '').slice(0, 160),
+          dur: Number.isFinite(v.duration) ? Math.round(v.duration) : 0,
+          t: Math.round(v.currentTime || 0),
+          paused: !!v.paused,
+          rs: v.readyState || 0,
+          area: Math.round((r.width || 0) * (r.height || 0)),
+        });
+      }
+      return out;
+    })()`;
+    const found = [];
+    for (const ctxId of this.contexts.keys()) {
+      try {
+        const vids = await this.evaluate(probe, false, 3000, ctxId);
+        if (Array.isArray(vids) && vids.length) found.push({ ctxId, vids });
+      } catch {}
+    }
+    return found;
+  }
+
+  /**
+   * 让页面里的视频真正播放起来，并停留指定秒数。
+   * 走的是页面自己的播放器（HLS/DASH/原生 video），因此媒体流量与真人观看完全一致。
+   */
+  async playPageVideo(maxSeconds) {
+    const bytesBefore = this.bytes;
+    const found = await this.probeVideos();
+    if (!found.length) return { played: false, reason: 'no-video' };
+    const best = found.sort((a, b) => (b.vids[0]?.area || 0) - (a.vids[0]?.area || 0))[0];
+    const ctxId = best.ctxId;
+
+    const startScript = `(async () => {
+      const vs = [...document.querySelectorAll('video')];
+      if (!vs.length) return { ok: false };
+      vs.sort((a, b) => {
+        const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+        return (br.width * br.height) - (ar.width * ar.height);
+      });
+      const v = vs[0];
+      v.muted = true; v.volume = 0;
+      try { v.play(); } catch (e) {}
+      if (v.paused) {
+        const cands = [...document.querySelectorAll('button,[class*=play],[class*=Play],[aria-label*=播放],[title*=播放]')];
+        for (const b of cands.slice(0, 60)) {
+          const tag = ((b.className || '') + ' ' + ((b.getAttribute && b.getAttribute('aria-label')) || '') + ' ' + (b.title || '')).toString();
+          if (/play|播放/i.test(tag)) { try { b.click(); break; } catch (e) {} }
+        }
+        try { v.play(); } catch (e) {}
+      }
+      return { ok: true, paused: !!v.paused, dur: Number.isFinite(v.duration) ? Math.round(v.duration) : 0 };
+    })()`;
+    try { await this.evaluate(startScript, true, 6000, ctxId); } catch {}
+
+    const probeT = `(() => {
+      const vs = [...document.querySelectorAll('video')];
+      if (!vs.length) return null;
+      const v = vs[0];
+      return { t: v.currentTime || 0, paused: !!v.paused, ended: !!v.ended,
+               dur: Number.isFinite(v.duration) ? v.duration : 0 };
+    })()`;
+
+    const limitMs = Math.max(3, maxSeconds) * 1000;
+    const t0 = Date.now();
+    let lastT = null, advanced = 0, dur = best.vids[0]?.dur || 0;
+    while (Date.now() - t0 < limitMs) {
+      if (this.crashed) break;
+      await sleep(1000);
+      let st = null;
+      try { st = await this.evaluate(probeT, false, 3000, ctxId); } catch { break; }
+      if (!st) break;
+      if (lastT !== null && st.t > lastT) advanced += st.t - lastT;
+      lastT = st.t;
+      if (st.dur > 0) dur = st.dur;
+      if (st.ended) break;
+    }
+    const secs = (Date.now() - t0) / 1000;
+    return {
+      played: advanced >= 1, advanced: Math.round(advanced), seconds: Math.round(secs),
+      duration: Math.round(dur), bytes: this.bytes - bytesBefore,
+    };
+  }
+
   /** 记录基线 */
   mark() { this._mark = { bytes: this.bytes, requests: this.requests, failed: this.failed }; }
 
@@ -680,6 +795,7 @@ class Traffic {
     this.t0 = Date.now();
     this.bytes = 0;
     this.pages = 0;
+    this.videoPages = 0;
     this.requests = 0;
     this.failed = 0;
     this.byType = new Map();
@@ -708,6 +824,7 @@ class Traffic {
   snapshot() {
     return {
       elapsedSec: Math.round(this.elapsed), bytes: this.bytes, pages: this.pages,
+      videoPages: this.videoPages,
       requests: this.requests, failed: this.failed, mbps: +(this.rate / 1e6).toFixed(3),
       byType: Object.fromEntries([...this.byType.entries()].map(([k, v]) => [k, v])),
       topHosts: [...this.hosts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20),
@@ -735,6 +852,9 @@ class Traffic {
     L.push(C.bold('── 流量汇总 ' + '─'.repeat(46)));
     L.push(`  总流量      ${C.cyan(fmtBytes(s.bytes))}`);
     L.push(`  页面数      ${s.pages}`);
+    if (s.videoPages) {
+      L.push(`  含视频页    ${s.videoPages}${C.dim(`（${(s.videoPages / Math.max(1, s.pages) * 100).toFixed(0)}% 的页面播了视频）`)}`);
+    }
     L.push(`  请求数      ${s.requests}${s.failed ? C.dim(`（失败 ${s.failed}）`) : ''}`);
     L.push(`  运行时长    ${fmtDur(s.elapsedSec)}`);
     L.push(`  平均速率    ${C.green(fmtRate(s.mbps * 1e6))}`);
@@ -764,6 +884,7 @@ function parseArgs(argv) {
     profile: join(homedir(), '.config', 'cnbrowse', 'browser-profile'),
     statsFile: '', chrome: '', port: 0, seed: '', heavyOnly: false, verbose: false,
     concurrency: 1, maxRate: 0, noImage: false, saveFailed: false, targetBytes: 0,
+    video: true, videoSeconds: [8, 25],
   };
   const a = argv.slice();
   const need = (i, k) => { if (i + 1 >= a.length) throw new Error(`${k} 需要一个参数`); return a[i + 1]; };
@@ -784,6 +905,12 @@ function parseArgs(argv) {
       case '--concurrency': o.concurrency = Math.max(1, parseInt(need(i, k), 10)); i++; break;
       case '--max-rate': o.maxRate = parseFloat(need(i, k)) * 1e6; i++; break;
       case '--target-traffic': o.targetBytes = parseSize(need(i, k)); i++; break;
+      case '--no-video': o.video = false; break;
+      case '--video-seconds': {
+        const v = need(i, k).split('-').map(Number);
+        o.videoSeconds = [v[0] || 8, v[1] ?? v[0] ?? 25];
+        i++; break;
+      }
       case '--quiet': case '-q': o.quiet = true; break;
       case '--headed': o.headed = true; break;
       case '--audio': o.audio = true; break;
@@ -825,6 +952,8 @@ cnbrowse —— 用真实浏览器随机浏览国内网站，产生与真人上�
       --heavy             只逛高流量站点（图片/视频/购物）
       --concurrency <n>   并行标签页数（默认 1，更像真人）
       --max-rate <Mbps>   限制平均速率上限（默认不限）
+      --no-video          不自动播放页面里的视频（默认会播）
+      --video-seconds <a-b>  每页视频播放时长区间（默认 8-25 秒）
       --profile <目录>    浏览器 profile 目录（保留 Cookie/缓存，默认 ~/.config/cnbrowse/...）
       --stats-file <路径> 持续把统计写入 JSON
       --chrome <路径>     指定 Chrome/Chromium 可执行文件
@@ -929,9 +1058,28 @@ class Runner {
     await page.scrollThrough({ maxSteps: randInt(6, 18) });
     await page.stimulate();
 
+    // 页面里有视频就播一会儿：媒体流量与真人观看一致
+    let video = null;
+    if (this.o.video) {
+      const maxSec = randInt(this.o.videoSeconds[0], this.o.videoSeconds[1]);
+      try {
+        video = await page.playPageVideo(maxSec);
+        if (video && video.played) {
+          this.traffic.videoPages++;
+          if (this.o.verbose) {
+            this.logln(C.dim(`      视频播放 ${video.advanced}s（页面时长 ${video.duration || '?'}s）`));
+          }
+        }
+      } catch (e) {
+        if (this.o.verbose) this.logln(C.dim(`      视频播放失败: ${e.message}`));
+      }
+    }
+
     // 停留（期间偶尔滚动，产生少量后续请求）
+    // 已经看了一会儿视频的话，停留时间折半，更像"看两眼就走"
     if (dwell) {
-      const s = randInt(this.o.minDwell, this.o.maxDwell);
+      const base = randInt(this.o.minDwell, this.o.maxDwell);
+      const s = (video && video.played) ? Math.max(1, Math.round(base / 2)) : base;
       const end = Date.now() + s * 1000;
       while (Date.now() < end && !this.stopped) {
         await sleep(randInt(300, 900));
@@ -940,7 +1088,7 @@ class Runner {
     }
     await page.waitForQuiet(400, 2000);
     const title = await page.title();
-    return { ...page.takeDelta(), title };
+    return { ...page.takeDelta(), title, video };
   }
 
   async browseOnce(page, site) {
@@ -950,6 +1098,11 @@ class Runner {
     const shown = (r0.title || site.n).slice(0, 50);
     this.logln(`\n  ${C.green('▶')} ${C.bold(site.n.padEnd(11))}${C.dim(site.u.replace(/^https?:\/\//, '').slice(0, 30).padEnd(31))}` +
       ` ${C.cyan(fmtBytes(r0.bytes).padStart(9))} ${C.dim(fmtRate(r0.bytes / Math.max(1, r0.sec ?? 1)).padStart(9))}  ${C.dim(shown)}`);
+    if (r0.video && r0.video.played) {
+      this.logln(C.dim(`      ▶ 已播放视频 ${r0.video.advanced}s` +
+        `（页面时长 ${r0.video.duration || '直播/?'}s）` +
+        ` 播放期间拉流 ${fmtBytes(r0.video.bytes || 0)}`));
+    }
     this.traffic.absorb(page, site, r0);
     this.traffic.persist();
     this.logln('  ' + this.traffic.line());
@@ -1076,6 +1229,7 @@ async function main() {
       (o.heavyOnly ? '  [仅高流量站]' : '') +
       `  并发标签页 ${o.concurrency}  停留 ${o.minDwell}-${o.maxDwell}s` +
       `  每站深入 ${o.depth} 层` +
+      (o.video ? `  视频 ${o.videoSeconds[0]}-${o.videoSeconds[1]}s` : '  不播视频') +
       (o.maxRate ? `  限速 ${(o.maxRate / 1e6).toFixed(2)} Mbps` : '') +
       (o.targetBytes ? `  目标 ${fmtBytes(o.targetBytes)}` : '')));
   }

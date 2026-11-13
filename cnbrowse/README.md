@@ -95,6 +95,8 @@ npx playwright install chromium
 | `--dwell <a-b>` | 3-20 | 每页停留秒数区间。**调大更像"在认真看"** |
 | `--concurrency <n>` | 1 | 并行标签页数。`1` 最像单人；`3~5` 流量更高但仍属真人范围 |
 | `--max-rate <Mbps>` | 不限 | 限制平均速率上限，避免持续跑满带宽（**推荐设置**） |
+| `--video-seconds <a-b>` | 8-25 | 每页视频播放时长区间 |
+| `--no-video` | 关 | 关闭自动播放页面视频 |
 | `--headed` | 关 | 显示浏览器窗口（默认无头运行） |
 | `--audio` | 关 | 允许播放声音（默认静音） |
 
@@ -105,6 +107,23 @@ npx playwright install chromium
 # 像一边刷图一边逛：多一点并发、只去图站
 ./cnbrowse -c photo,shop --heavy --concurrency 4 --max-rate 20
 ```
+
+### 页面里有视频，自动播
+
+逛到带视频的页面时，工具会自动找到页面里的 `<video>`（包括同源 iframe 内的播放器），
+静音播放一段时间后再继续逛下一站。播放走的是页面自己的播放器（原生 video / hls.js / dash.js /
+直播 WebSocket），所以媒体流量与真人观看完全一致，也**不限于任何特定站点**。
+
+```bash
+./cnbrowse -c video --video-seconds 15-40      # 只逛视频站，每页看 15~40 秒
+./cnbrowse --no-video                          # 只要图文流量
+```
+
+实测：爱奇艺首页播 7 秒、斗鱼直播播 10 秒都能正常起播并产生媒体流量；
+汇总里会出现「含视频页」以及每页的「播放期间拉流」字节数。
+
+> 说明：部分站点首页的 `<video>` 只是预览小窗，真正的大流量出现在详情页，
+> 配合默认的 `--depth 1` 效果更明显。直播站若走 WebSocket 传流，字节数按 WebSocket 帧计入。
 
 ### 其它
 

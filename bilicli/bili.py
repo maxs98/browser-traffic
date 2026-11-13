@@ -16,6 +16,7 @@ import hashlib
 import http.server
 import json
 import os
+import random
 import re
 import shutil
 import socketserver
@@ -104,6 +105,13 @@ def human_time(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def _safe_filename(name: str, limit: int = 80) -> str:
+    """把标题清洗成安全的文件名（去掉路径分隔符和控制字符）。"""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._")
+    return (cleaned[:limit] or "video")
+
+
 def parse_size(text: str) -> int:
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmMgG]?)\s*", text or "")
     if not m:
@@ -156,6 +164,17 @@ class Stats:
         with self._lock:
             if len(self.errors) < 20:
                 self.errors.append(msg)
+
+    def merge(self, other: "Stats") -> None:
+        """把另一段播放的统计并入本对象（漫游时做总账）。"""
+        if other is None:
+            return
+        with self._lock:
+            for k, v in other.bytes.items():
+                self.bytes[k] = self.bytes.get(k, 0) + v
+            for k, v in other.requests.items():
+                self.requests[k] = self.requests.get(k, 0) + v
+            self.errors.extend(other.errors[:max(0, 20 - len(self.errors))])
 
     @property
     def elapsed(self) -> float:
@@ -759,7 +778,8 @@ class Player:
     def __init__(self, client: Client, media: Media, *, log: Log, volume: int = 100,
                  browser_mode: bool = True, video_mode: str = "stream",
                  prefer_codec: str = "avc", max_height: int = 0, max_qid: int = 0,
-                 start_at: float = 0.0, speed: float = 1.0, extra_args: Optional[List[str]] = None):
+                 start_at: float = 0.0, speed: float = 1.0, extra_args: Optional[List[str]] = None,
+                 quiet: bool = False, out_dir: Optional[Path] = None):
         self.client = client
         self.media = media
         self.log = log
@@ -769,6 +789,12 @@ class Player:
         self.start_at = max(0.0, start_at)
         self.speed = speed
         self.extra_args = list(extra_args or [])
+        # 漫游模式下用：不重复打印每集头部/汇总，只留一行进度
+        self.quiet = quiet
+        # 被 Ctrl-C 打断（漫游循环据此决定是否继续）
+        self.interrupted = False
+        # realtime 模式的输出目录（漫游时统一存到用户指定目录）
+        self.out_dir = Path(out_dir) if out_dir else None
         self.stats = Stats()
         self.audio = media.best_audio()
         self.video = media.pick_video(prefer=prefer_codec, max_height=max_height, max_qid=max_qid)
@@ -969,38 +995,47 @@ class Player:
         self.proxy.start()
 
         m = self.media
-        print()
-        print(C.bold(f"  {m.title[:66]}"))
-        meta = []
-        if m.owner:
-            meta.append(f"UP: {m.owner}")
-        meta.append(f"时长 {human_time(m.duration)}" if m.duration else "时长未知")
-        meta.append(f"音频 {self.audio.codec or '?'} {self.audio.bandwidth//1000}kbps")
-        if self.video is not None:
-            meta.append(f"视频 {self.video.width}x{self.video.height} "
-                        f"{self.video.codec} {self.video.bandwidth//1000}kbps")
-        print(C.dim("  " + " · ".join(meta)))
-        print(C.dim(f"  播放器 {Path(exe).name} · 流经本地代理 127.0.0.1:{self.proxy.port}"
-                    f" · 上游 Chrome 指纹 {self.client.impersonate}"))
-        mode_desc = {
-            "stream": C.green("模拟浏览器拉流（视频轨按实时码率取流后丢弃）"),
-            "realtime": C.green("模拟浏览器播放并保存视频"),
-            "audio": C.yellow("仅音频（流量明显小于浏览器，隐蔽性略低）"),
-        }.get(self.video_mode, C.yellow(self.video_mode))
-        print(f"  流量模式 {mode_desc}")
-        if self.client.logged_in:
-            print(C.dim(f"  已登录：{self.client.uname()}（可用 1080P+ 等高清晰度）"))
-        else:
-            print(C.dim("  未登录：清晰度上限通常为 480P/360P，"
-                        "用 `bilicli login` 导入浏览器 Cookie 可解锁 1080P"))
-        print()
+        if not self.quiet:
+            print()
+            print(C.bold(f"  {m.title[:66]}"))
+            meta = []
+            if m.owner:
+                meta.append(f"UP: {m.owner}")
+            meta.append(f"时长 {human_time(m.duration)}" if m.duration else "时长未知")
+            meta.append(f"音频 {self.audio.codec or '?'} {self.audio.bandwidth//1000}kbps")
+            if self.video is not None:
+                meta.append(f"视频 {self.video.width}x{self.video.height} "
+                            f"{self.video.codec} {self.video.bandwidth//1000}kbps")
+            print(C.dim("  " + " · ".join(meta)))
+            print(C.dim(f"  播放器 {Path(exe).name} · 流经本地代理 127.0.0.1:{self.proxy.port}"
+                        f" · 上游 Chrome 指纹 {self.client.impersonate}"))
+            mode_desc = {
+                "stream": C.green("模拟浏览器拉流（视频轨按实时码率取流后丢弃）"),
+                "realtime": C.green("模拟浏览器播放并保存视频"),
+                "audio": C.yellow("仅音频（流量明显小于浏览器，隐蔽性略低）"),
+            }.get(self.video_mode, C.yellow(self.video_mode))
+            print(f"  流量模式 {mode_desc}")
+            if self.client.logged_in:
+                print(C.dim(f"  已登录：{self.client.uname()}（可用 1080P+ 等高清晰度）"))
+            else:
+                print(C.dim("  未登录：清晰度上限通常为 480P/360P，"
+                            "用 `bilicli login` 导入浏览器 Cookie 可解锁 1080P"))
+            print()
 
         cmd = self._build_cmd(exe, mode, self.proxy.url_for("audio"))
         self.log.debug("执行: " + " ".join(cmd[:8]) + " ...")
 
         down_dir: Optional[Path] = None
         if self.video_mode == "realtime":
-            down_dir = Path(tempfile.mkdtemp(prefix="bilicli-"))
+            if self.out_dir is not None:
+                down_dir = self.out_dir
+                try:
+                    down_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as exc:
+                    self.log.warn(f"无法创建输出目录 {down_dir}：{exc}")
+                    down_dir = Path(tempfile.mkdtemp(prefix="bilicli-"))
+            else:
+                down_dir = Path(tempfile.mkdtemp(prefix="bilicli-"))
             # 音频不重复下载：在代理层把播放用的同一份字节旁路写入磁盘
             try:
                 afh = open(down_dir / "audio.m4s", "wb")
@@ -1022,11 +1057,15 @@ class Player:
             prog = threading.Thread(target=self._progress, daemon=True)
             prog.start()
             rc = self._ffplay.wait()
+            # ffplay 被信号直接杀掉（例如 Ctrl-C 打到整个进程组）也算打断
+            if rc is not None and rc < 0:
+                self.interrupted = True
             if rc == 0:
                 # 音频放完了，等视频轨把剩余缓冲拉完（浏览器也这样）
                 if self._video_thread and self._video_thread.is_alive():
                     self._video_thread.join(timeout=20)
         except KeyboardInterrupt:
+            self.interrupted = True
             print()
         finally:
             self._stop.set()
@@ -1047,15 +1086,18 @@ class Player:
                 except Exception:
                     pass
 
-        print(self.stats.summary())
+        if not self.quiet:
+            print(self.stats.summary())
         if self.video_mode == "realtime" and down_dir:
             vid = down_dir / "video.m4s"
             aud = down_dir / "audio.m4s"
             slot = self.proxy.tee.get("audio") or {}
             if slot.get("written"):
                 self.log.info(f"  音频轨已保存 {human_bytes(slot['written'])} -> {aud}")
-            self.log.info(f"  正在合并 A/V -> {down_dir}/output.mp4")
-            self._mux(aud, vid, down_dir / "output.mp4")
+            out_name = _safe_filename(f"{self.media.bvid or 'video'}-{self.media.title}") + ".mp4"
+            out_file = down_dir / (out_name if self.out_dir is not None else "output.mp4")
+            self.log.info(f"  正在合并 A/V -> {out_file}")
+            self._mux(aud, vid, out_file)
         return 0 if rc in (0, 1) else rc
 
     def _mux(self, audio_path: Path, video_path: Path, out: Path) -> None:
@@ -1089,6 +1131,218 @@ class Player:
 # --------------------------------------------------------------------------
 # 子命令
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# 自动漫游：视频池
+# --------------------------------------------------------------------------
+def _parse_duration_str(text: str) -> int:
+    """把 "12:34" / "1:02:03" 转成秒。"""
+    if not text:
+        return 0
+    parts = str(text).split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return 0
+    sec = 0
+    for n in nums:
+        sec = sec * 60 + n
+    return sec
+
+
+def _norm_video(it: Dict[str, Any], pn: int = 1) -> Optional[Dict[str, Any]]:
+    """把各接口返回的视频条目统一成池内格式。"""
+    bvid = (it.get("bvid") or "").strip()
+    if not bvid:
+        return None
+    title = re.sub(r"<[^>]+>", "", (it.get("title") or "")).strip()
+    # 接口偶尔会混进已失效/已删除的条目，直接丢掉
+    if any(k in title for k in ("已失效", "视频不存在", "已被删除")):
+        return None
+    owner = it.get("owner")
+    if isinstance(owner, dict):
+        owner_name = owner.get("name") or ""
+    else:
+        owner_name = owner or it.get("author") or ""
+    dur = it.get("duration")
+    if dur is None:
+        dur = _parse_duration_str(it.get("length") or "")
+    if isinstance(dur, str):
+        # 搜索接口给的是 "12:34" 这种字符串
+        dur = _parse_duration_str(dur)
+    else:
+        try:
+            dur = int(dur or 0)
+        except (TypeError, ValueError):
+            dur = 0
+    try:
+        page_no = int(it.get("pn") or pn or 1)
+    except (TypeError, ValueError):
+        page_no = 1
+    return {
+        "bvid": bvid,
+        "title": title,
+        "owner": owner_name,
+        "duration": dur,
+        "pn": page_no,
+    }
+
+
+def _fetch_popular(client: Client, page: int = 1, ps: int = 50) -> List[Dict[str, Any]]:
+    r = client.api("/x/web-interface/popular", {"ps": ps, "pn": page})
+    return ((r.get("data") or {}).get("list")) or []
+
+
+def _fetch_ranking(client: Client, rid: int = 0) -> List[Dict[str, Any]]:
+    r = client.api("/x/web-interface/ranking/v2", {"rid": rid, "type": "all"})
+    return ((r.get("data") or {}).get("list")) or []
+
+
+def _fetch_related(client: Client, bvid: str) -> List[Dict[str, Any]]:
+    r = client.api("/x/web-interface/archive/related", {"bvid": bvid})
+    data = r.get("data")
+    return data if isinstance(data, list) else []
+
+
+def _fetch_search(client: Client, keyword: str, page: int = 1, ps: int = 30) -> List[Dict[str, Any]]:
+    r = client.search(keyword, page=page, page_size=ps)
+    return ((r.get("data") or {}).get("result")) or []
+
+
+def _fetch_up_videos(client: Client, mid: int, page: int = 1, ps: int = 30) -> List[Dict[str, Any]]:
+    """UP 主投稿列表（需要 wbi 签名，风控时可能返回空）。"""
+    params = {"mid": mid, "pn": page, "ps": ps, "order": "pubdate", "platform": "web"}
+    r = client.api("/x/space/wbi/arc/search", params, wbi=True,
+                   referer=f"https://space.bilibili.com/{mid}/video")
+    vlist = (((r.get("data") or {}).get("list")) or {}).get("vlist") or []
+    return vlist
+
+
+def _fetch_multi_pages(client: Client, bvid: str) -> List[Dict[str, Any]]:
+    """把一个多P视频展开成按 P 排序的条目。"""
+    v = client.view(bvid=bvid)
+    if v.get("code") != 0:
+        return []
+    d = v["data"]
+    out = []
+    for i, page in enumerate(d.get("pages") or [], 1):
+        out.append({
+            "bvid": bvid,
+            "title": f"{d.get('title') or ''} · P{i} {page.get('part') or ''}".strip(),
+            "owner": ((d.get("owner") or {}).get("name")) or "",
+            "duration": int(page.get("duration") or 0),
+            "pn": i,
+        })
+    return out
+
+
+class VideoPool:
+    """自动漫游的视频池：按需补货、去重、可从相关推荐持续扩张。"""
+
+    def __init__(self, client: Client, log: Log, *, source: str = "popular",
+                 keyword: str = "", mid: int = 0, seed_bvid: str = "",
+                 expand: bool = True, shuffle: bool = False, min_duration: int = 0,
+                 max_duration: int = 0):
+        self.client = client
+        self.log = log
+        self.source = source
+        self.keyword = keyword
+        self.mid = mid
+        self.seed_bvid = seed_bvid
+        self.expand = expand
+        self.shuffle = shuffle
+        self.min_duration = max(0, min_duration)
+        self.max_duration = max(0, max_duration)
+        self.queue: List[Dict[str, Any]] = []
+        self.seen: set = set()
+        self.played: set = set()
+        self.page = 0
+        self.empty_rounds = 0
+
+    @staticmethod
+    def _key(v: Dict[str, Any]) -> Tuple[str, int]:
+        return (v.get("bvid") or "", int(v.get("pn") or 1))
+
+    def _push(self, items: List[Dict[str, Any]]) -> int:
+        added = 0
+        for it in items or []:
+            v = _norm_video(it)
+            if not v:
+                continue
+            k = self._key(v)
+            if k in self.seen:
+                continue
+            if self.min_duration and v["duration"] and v["duration"] < self.min_duration:
+                continue
+            if self.max_duration and v["duration"] and v["duration"] > self.max_duration:
+                continue
+            self.seen.add(k)
+            self.queue.append(v)
+            added += 1
+        if added and self.shuffle:
+            random.shuffle(self.queue)
+        return added
+
+    def refill(self) -> int:
+        src = self.source
+        try:
+            if src in ("related", "multi"):
+                bv, self.seed_bvid = self.seed_bvid, ""
+                if not bv:
+                    return 0
+                items = (_fetch_related(self.client, bv) if src == "related"
+                         else _fetch_multi_pages(self.client, bv))
+                return self._push(items)
+            if src == "ranking":
+                return self._push(_fetch_ranking(self.client))
+            if src == "search":
+                self.page += 1
+                if self.page > 50:
+                    return 0
+                return self._push(_fetch_search(self.client, self.keyword, self.page))
+            if src == "up":
+                self.page += 1
+                if self.page > 50:
+                    return 0
+                return self._push(_fetch_up_videos(self.client, self.mid, self.page))
+            # 默认：热门（翻页，翻到头再从头来）
+            self.page += 1
+            if self.page > 10:
+                self.page = 1
+            return self._push(_fetch_popular(self.client, self.page))
+        except Exception as exc:
+            self.log.debug(f"补货失败（{src}）: {exc}")
+            return 0
+
+    def next(self) -> Optional[Dict[str, Any]]:
+        for _ in range(10):
+            while self.queue:
+                v = self.queue.pop(0)
+                k = self._key(v)
+                if k in self.played:
+                    continue
+                self.played.add(k)
+                return v
+            if self.refill() > 0:
+                self.empty_rounds = 0
+                continue
+            self.empty_rounds += 1
+            if self.empty_rounds >= 2:
+                return None
+            time.sleep(0.8)
+        return None
+
+    def expand_from(self, bvid: str) -> int:
+        """把当前视频的相关推荐塞进池子，实现"一直往下漫游"。"""
+        if not self.expand or not bvid:
+            return 0
+        try:
+            return self._push(_fetch_related(self.client, bvid))
+        except Exception as exc:
+            self.log.debug(f"相关推荐获取失败: {exc}")
+            return 0
+
+
 def _fmt_count(n: Any) -> str:
     try:
         n = int(n)
@@ -1219,6 +1473,144 @@ def cmd_play(args, client: Client, log: Log) -> int:
         extra_args=args.player_arg,
     )
     return player.run()
+
+
+def cmd_roam(args, client: Client, log: Log) -> int:
+    """自动漫游：自动取播放链接，播完一个自动接下一条。"""
+    source = args.source
+    keyword = (getattr(args, "keyword", "") or "").strip()
+    seed_bvid = ""
+
+    if args.target:
+        ref = parse_target(args.target)
+        if ref["kind"] == "keyword":
+            keyword = keyword or ref["keyword"]
+            if source == "popular":
+                source = "search"
+        elif ref["kind"] == "video":
+            seed_bvid = ref.get("bvid") or ""
+            if source == "popular":
+                source = "related"
+        else:
+            log.error(f"漫游暂不支持 {ref['kind']} 类型，请用 play 播放")
+            return 1
+        if ref.get("aid") and not seed_bvid:
+            seed_bvid = ""
+
+    if source == "search" and not keyword:
+        log.error("--source search 需要 --keyword，或直接传关键词作为位置参数")
+        return 1
+    if source == "up" and not args.mid:
+        log.error("--source up 需要 --mid <UP主UID>")
+        return 1
+    if source in ("related", "multi") and not seed_bvid:
+        log.error(f"--source {source} 需要一个起点视频（BV 号或链接）")
+        return 1
+
+    try:
+        dlo, dhi = [float(x) for x in str(args.delay).split("-", 1)]
+    except Exception:
+        dlo = dhi = 2.0
+    dhi = max(dlo, dhi)
+
+    deadline = 0.0
+    if args.minutes:
+        deadline = time.time() + args.minutes * 60
+    if args.hours:
+        deadline = time.time() + args.hours * 3600
+
+    pool = VideoPool(
+        client, log, source=source, keyword=keyword, mid=args.mid or 0,
+        seed_bvid=seed_bvid, expand=not args.no_expand,
+        shuffle=args.shuffle, min_duration=args.min_duration,
+        max_duration=args.max_duration,
+    )
+    save_dir = Path(args.save_dir) if args.save_dir else None
+
+    src_desc = {
+        "popular": "热门", "ranking": "排行榜", "related": "相关推荐漫游",
+        "multi": "多P连播", "search": f"搜索「{keyword}」", "up": f"UP {args.mid} 投稿",
+    }.get(source, source)
+    print()
+    print(C.bold("  自动漫游"))
+    print(C.dim(f"  来源 {src_desc} · 自动连播 · "
+                + (f"最多 {args.count} 个" if args.count else "不限数量")
+                + (f" · 限时 {args.hours*60+args.minutes:.0f} 分钟" if deadline else "")
+                + ("" if args.no_expand else " · 相关推荐扩张")))
+    print(C.dim("  按 Ctrl-C 停止"))
+    print()
+
+    agg = Stats()
+    played = 0
+    skipped = 0
+    try:
+        while True:
+            if args.count and played >= args.count:
+                break
+            if deadline and time.time() >= deadline:
+                break
+
+            v = pool.next()
+            if not v:
+                log.warn("视频池已空，停止漫游")
+                break
+
+            try:
+                media = resolve(
+                    client, v["bvid"], quality=args.quality,
+                    pn=int(v.get("pn") or 1), prefer_codec=args.codec,
+                    max_height=args.max_height, log=log,
+                )
+            except Exception as exc:
+                skipped += 1
+                log.warn(f"跳过 {v['bvid']}：{exc}")
+                continue
+            if media.audio is None:
+                skipped += 1
+                log.warn(f"跳过 {v['bvid']}：没有可用音轨")
+                continue
+
+            idx = played + 1
+            tag = f"[{idx}/{args.count}]" if args.count else f"[{idx}]"
+            print(f"  {C.cyan(tag)} {C.bold((media.title or v['title'])[:56])}")
+            print(C.dim(f"      {v['bvid']} · UP {media.owner or v['owner'] or '?'} · "
+                        f"{human_time(media.duration)} · {media.quality_label()}"))
+
+            player = Player(
+                client, media, log=log, volume=args.volume,
+                browser_mode=(args.mode != "audio"), video_mode=args.mode,
+                prefer_codec=args.codec, max_height=args.max_height,
+                start_at=0.0, speed=args.speed, extra_args=args.player_arg,
+                quiet=True, out_dir=save_dir if args.mode == "realtime" else None,
+            )
+            player.run()
+            played += 1
+            agg.merge(player.stats)
+
+            if player.interrupted:
+                break
+
+            pool.expand_from(v["bvid"])
+
+            total = agg.bytes["audio"] + agg.bytes["video"]
+            rate = total * 8 / max(1.0, agg.elapsed) / 1e6
+            print(C.dim(f"      累计 {human_bytes(total)} · 已播 {played} 个"
+                        f"{' · 跳过 ' + str(skipped) if skipped else ''}"
+                        f" · 平均 {rate:.2f} Mbps · 用时 {human_time(agg.elapsed)}"))
+
+            if args.count and played >= args.count:
+                break
+            if deadline and time.time() >= deadline:
+                break
+            time.sleep(random.uniform(dlo, dhi))
+    except KeyboardInterrupt:
+        print()
+
+    print(agg.summary())
+    print(C.dim(f"  共播放 {played} 个视频"
+                + (f"，跳过 {skipped} 个" if skipped else "")
+                + f"，用时 {human_time(agg.elapsed)}"))
+    return 0
 
 
 def cmd_login(args, client: Client, log: Log) -> int:
@@ -1506,6 +1898,25 @@ def cmd_doctor(args, client: Client, log: Log) -> int:
 # --------------------------------------------------------------------------
 # 入口
 # --------------------------------------------------------------------------
+def _add_playback_args(sp: argparse.ArgumentParser, *, include_page: bool = True) -> None:
+    """play / roam 共用的播放参数。"""
+    if include_page:
+        sp.add_argument("-p", "--page", type=int, default=1, help="分P 序号（从 1 开始）")
+    sp.add_argument("-q", "--quality", default="auto",
+                    choices=list(QUALITY_ALIASES.keys()),
+                    help="清晰度（默认 auto；未登录通常最高 480P）")
+    sp.add_argument("-m", "--mode", default="stream", choices=["stream", "realtime", "audio"],
+                    help="stream=模拟浏览器拉流(默认) realtime=同时保存为mp4 audio=纯音频")
+    sp.add_argument("-vol", "--volume", type=int, default=100, help="音量 0-100（默认 100）")
+    sp.add_argument("-r", "--speed", type=float, default=1.0, help="播放倍速")
+    sp.add_argument("--codec", default="avc", choices=["avc", "av01", "hev1", "any"],
+                    help="优先编码（默认 avc，最贴近网页默认）")
+    sp.add_argument("--max-height", type=int, default=0, help="限制最大高度，如 720")
+    sp.add_argument("--player-arg", action="append", default=[],
+                    help="透传给播放器的额外参数（可多次）")
+    sp.add_argument("--quiet", action="store_true", help="安静模式")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="bilicli",
@@ -1514,6 +1925,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例:\n"
             "  bilicli play BV1GJ411x7h7                  # 只听声音，后台拉视频轨伪装流量\n"
+            "  bilicli roam                                # 自动漫游：从热门开始，一个接一个播\n"
+            "  bilicli roam BV1GJ411x7h7                   # 从该视频的相关推荐开始漫游\n"
+            "  bilicli roam --source ranking -n 20         # 排行榜连播 20 个\n"
+            "  bilicli roam BV1xx411c7mD --source multi    # 多P连播\n"
             "  bilicli play https://b23.tv/xxxxxx -q 1080p\n"
             "  bilicli play BV1xx411c7mD -p 3              # 第 3 个分P\n"
             "  bilicli play BV1xx411c7mD -m audio          # 只省流量：纯音频\n"
@@ -1532,21 +1947,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("play", help="播放（默认只听声音 + 伪装视频流量）")
     sp.add_argument("target", help="BV 号 / av 号 / 视频链接 / b23.tv 短链 / 剧集 ep 号 / 关键词")
-    sp.add_argument("-q", "--quality", default="auto",
-                    choices=list(QUALITY_ALIASES.keys()),
-                    help="清晰度（默认 auto；未登录通常最高 480P）")
-    sp.add_argument("-p", "--page", type=int, default=1, help="分P 序号（从 1 开始）")
-    sp.add_argument("-m", "--mode", default="stream", choices=["stream", "realtime", "audio"],
-                    help="stream=模拟浏览器拉流(默认) realtime=同时保存为mp4 audio=纯音频")
-    sp.add_argument("-vol", "--volume", type=int, default=100, help="音量 0-100（默认 100）")
     sp.add_argument("-ss", "--start", type=float, default=0.0, help="从第几秒开始")
-    sp.add_argument("-r", "--speed", type=float, default=1.0, help="播放倍速")
-    sp.add_argument("--codec", default="avc", choices=["avc", "av01", "hev1", "any"],
-                    help="优先编码（默认 avc，最贴近网页默认）")
-    sp.add_argument("--max-height", type=int, default=0, help="限制最大高度，如 720")
-    sp.add_argument("--player-arg", action="append", default=[],
-                    help="透传给播放器的额外参数（可多次）")
-    sp.add_argument("--quiet", action="store_true", help="安静模式")
+    _add_playback_args(sp)
+
+    sr = sub.add_parser("roam", help="自动漫游：播完一个自动接下一条")
+    sr.add_argument("target", nargs="?", default=None,
+                    help="起点视频（可选）：BV 号 / 链接 / 关键词；留空则从热门开始")
+    sr.add_argument("--source", default="popular",
+                    choices=["popular", "ranking", "related", "multi", "search", "up"],
+                    help="视频来源（默认 popular=热门）")
+    sr.add_argument("--keyword", default="", help="--source search 时使用的关键词")
+    sr.add_argument("--mid", type=int, default=0, help="--source up 时的 UP 主 UID")
+    sr.add_argument("-n", "--count", type=int, default=0, help="播放多少个后停止（0=不限）")
+    sr.add_argument("--minutes", type=float, default=0.0, help="运行多少分钟后停止")
+    sr.add_argument("--hours", type=float, default=0.0, help="运行多少小时后停止")
+    sr.add_argument("--shuffle", action="store_true", help="打乱播放顺序")
+    sr.add_argument("--no-expand", action="store_true",
+                    help="不从相关推荐扩张，只用当前来源")
+    sr.add_argument("--min-duration", type=int, default=0, help="跳过短于 N 秒的视频")
+    sr.add_argument("--max-duration", type=int, default=0, help="跳过长于 N 秒的视频（0=不限）")
+    sr.add_argument("--delay", default="1-4", help="视频之间停顿秒数区间（默认 1-4）")
+    sr.add_argument("--save-dir", default=None, help="-m realtime 时的保存目录")
+    _add_playback_args(sr, include_page=False)
 
     ss = sub.add_parser("search", help="搜索视频")
     ss.add_argument("keyword")
@@ -1580,7 +2002,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     handlers = {
         "play": cmd_play, "search": cmd_search, "info": cmd_info,
-        "login": cmd_login, "doctor": cmd_doctor,
+        "roam": cmd_roam, "login": cmd_login, "doctor": cmd_doctor,
     }
     try:
         return handlers[args.command](args, client, log)
