@@ -99,6 +99,7 @@ npx playwright install chromium
 | `--no-video` | 关 | 关闭自动播放页面视频 |
 | `--screenshot <目录>` | 关 | 视频起播 2 秒后自动截图，用来确认画面真的在动 |
 | `--url <网址>` | 关 | 直接指定页面浏览（可多次），用于测试具体播放页 |
+| `--video-roam` | 关 | 随机漫游：跳到哪算哪，页面上有视频就播一会儿，再跳下一个 |
 | `--headed` | 关 | 显示浏览器窗口（默认无头运行） |
 | `--audio` | 关 | 允许播放声音（默认静音） |
 
@@ -123,6 +124,30 @@ npx playwright install chromium
 # 直接测某个播放页，并截图确认画面
 ./cnbrowse --url https://www.bilibili.com/video/BV1GJ411x7h7 \
   --headed --video-seconds 20-30 --screenshot /tmp/shots
+```
+
+### 随机漫游（视频优先）
+
+`--video-roam` 是在一个站点里"乱点"：每页播一会儿（有视频就播），然后从页面里随机挑一个链接跳过去，
+不区分是视频页还是文章页，真人怎么点它就怎么点。同一个视频不会立刻重复。
+
+```bash
+# 从 B 站某个视频开始，一个接一个地往下看
+./cnbrowse --url https://www.bilibili.com/video/BV1GJ411x7h7 \
+  --video-roam --video-seconds 10-25 --headed
+
+# 从站点池里随机开始
+./cnbrowse --video-roam -c video
+```
+
+输出长这样：
+
+```
+  ▶ [1] www.bilibili.com      10.54 MB  【官方 MV】Never Gonna Give You Up - Rick Astley
+      ▶ 已播放 3s（页面时长 213s）拉流 240 KB
+      → 下一个 https://www.bilibili.com/video/BV1Sb41177Je/
+  ▶ [2] www.bilibili.com       1.77 MB  外国黑胖子跳舞原版素材
+      （本页没检测到可播放视频）
 ```
 
 实测：爱奇艺首页播 7 秒、斗鱼直播播 10 秒都能正常起播并产生媒体流量；

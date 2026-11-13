@@ -635,6 +635,57 @@ class Page {
     return pick(scored.slice(0, Math.min(25, scored.length)));
   }
 
+  /**
+   * 从当前页面收集"下一个可逛的页面"。
+   * 不限制页面类型：视频页优先，但活动页/文章页也会被选中——真人本来就乱点。
+   */
+  async pickNextLinks(exclude = new Set(), limit = 40) {
+    const cur = (await this.url()) || '';
+    let curKey = cur;
+    try { const u = new URL(cur); curKey = u.origin + u.pathname; } catch {}
+    const links = await this.evaluate(`(() => {
+      const out = [];
+      const seen = new Set();
+      for (const a of document.querySelectorAll('a[href]')) {
+        const h = a.getAttribute('href') || '';
+        if (!h || h.startsWith('javascript')) continue;
+        let abs;
+        try { abs = new URL(h, location.href); } catch { continue; }
+        if (abs.origin !== location.origin) continue;
+        const key = abs.origin + abs.pathname;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const txt = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
+        out.push({
+          u: abs.href, key,
+          text: txt.slice(0, 90),
+          hasTime: /\\d{1,2}:\\d{2}/.test(txt),
+        });
+        if (out.length > 900) break;
+      }
+      return out;
+    })()`) || [];
+
+    // 视频页加权，但不做硬过滤
+    const VIDEO_RE = /(\/video\/(BV|av)[0-9A-Za-z]+|\/bangumi\/play\/(ep|ss)\d+|\/cheese\/play\/|\/watch|\/v_\d+\.html|\/cover\/|\/ep\d+|\/ss\d+)/i;
+    const seen = new Set();
+    const out = [];
+    for (const l of links) {
+      if (!l.u || l.key === curKey) continue;
+      if (exclude.has(l.u) || exclude.has(l.key)) continue;
+      if (seen.has(l.key)) continue;
+      seen.add(l.key);
+      let s = Math.random() * 1.5;
+      if (VIDEO_RE.test(l.key)) s += 8;
+      if (l.hasTime) s += 2;
+      if (l.text && l.text.length >= 6 && l.text.length <= 90) s += 1;
+      if (/登录|注册|下载客户端|充值|退出/.test(l.text || '')) s -= 6;
+      if (s > 0) out.push({ u: l.u, s });
+    }
+    out.sort((a, b) => b.s - a.s);
+    return shuffle(out.slice(0, Math.min(limit, out.length))).map((x) => x.u);
+  }
+
   async url() {
     try {
       const { result } = await this.cdp.send('Runtime.evaluate',
@@ -939,7 +990,7 @@ function parseArgs(argv) {
     profile: join(homedir(), '.config', 'cnbrowse', 'browser-profile'),
     statsFile: '', chrome: '', port: 0, seed: '', heavyOnly: false, verbose: false,
     concurrency: 1, maxRate: 0, noImage: false, saveFailed: false, targetBytes: 0,
-    video: true, videoSeconds: [8, 25], screenshots: '', urls: [],
+    video: true, videoSeconds: [8, 25], screenshots: '', urls: [], videoRoam: false,
   };
   const a = argv.slice();
   const need = (i, k) => { if (i + 1 >= a.length) throw new Error(`${k} 需要一个参数`); return a[i + 1]; };
@@ -963,6 +1014,7 @@ function parseArgs(argv) {
       case '--no-video': o.video = false; break;
       case '--screenshot': o.screenshots = need(i, k); i++; break;
       case '--url': o.urls.push(need(i, k)); i++; break;
+      case '--video-roam': o.videoRoam = true; break;
       case '--video-seconds': {
         const v = need(i, k).split('-').map(Number);
         o.videoSeconds = [v[0] || 8, v[1] ?? v[0] ?? 25];
@@ -1013,6 +1065,7 @@ cnbrowse —— 用真实浏览器随机浏览国内网站，产生与真人上�
       --video-seconds <a-b>  每页视频播放时长区间（默认 8-25 秒）
       --screenshot <目录>  视频起播 2 秒后自动截图，用于确认画面在动
       --url <网址>        直接指定要浏览的页面（可多次；用于测试某个具体播放页）
+      --video-roam        视频连播：每段播一会儿就随机跳到同站的下一个视频
       --profile <目录>    浏览器 profile 目录（保留 Cookie/缓存，默认 ~/.config/cnbrowse/...）
       --stats-file <路径> 持续把统计写入 JSON
       --chrome <路径>     指定 Chrome/Chromium 可执行文件
@@ -1265,6 +1318,78 @@ class Runner {
     }
     await Promise.all(workers);
   }
+
+  hostOf(u) {
+    try { return new URL(u).hostname; } catch { return String(u).slice(0, 30); }
+  }
+
+  /** 视频连播：在当前站点里随机跳到别的视频，每段播一会儿就换 */
+  async runVideoRoam() {
+    const o = this.o;
+    let page;
+    try {
+      page = await this.browser.newPage();
+    } catch (e) {
+      console.error(C.red(`  标签页创建失败: ${e.message}`));
+      return;
+    }
+    const startUrl = (o.urls && o.urls[0]) || o._pool[0].u;
+    let url = startUrl;
+    const visited = new Set();
+    const queue = [];
+    let n = 0;
+    this.logln('');
+    this.logln(C.bold('  视频连播'));
+    this.logln(C.dim(`  起点 ${startUrl}`));
+    this.logln(C.dim(`  每个视频播 ${o.videoSeconds[0]}-${o.videoSeconds[1]}s，然后随机跳到下一个`));
+    this.logln(C.dim('  按 Ctrl-C 停止'));
+
+    try {
+      while (!this.shouldStop()) {
+        visited.add(url);
+        try { const u = new URL(url); visited.add(u.origin + u.pathname); } catch {}
+
+        const r = await this.visit(page, url, 'video', true);
+        const host = this.hostOf(url);
+        this.traffic.absorb(page, { n: host }, r);
+        this.traffic.persist();
+        n++;
+
+        this.logln(`\n  ${C.green('▶')} ${C.cyan(`[${n}]`)} ${C.dim(host.padEnd(20))} ` +
+          `${C.cyan(fmtBytes(r.bytes).padStart(9))}  ${(r.title || '').slice(0, 48)}`);
+        if (r.video && r.video.played) {
+          this.logln(C.dim(`      ▶ 已播放 ${r.video.advanced}s` +
+            `（页面时长 ${r.video.duration || '直播/?'}s）拉流 ${fmtBytes(r.video.bytes || 0)}` +
+            (r.video.onScreen === false ? C.yellow('  ⚠ 播放器不在视口内') : '')));
+        } else {
+          this.logln(C.dim('      （本页没检测到可播放视频）'));
+        }
+        this.logln('  ' + this.traffic.line());
+
+        if (this.shouldStop()) break;
+
+        // 先把当前页发现的视频链接全部收进队列，用完再从新页面继续收集
+        if (queue.length < 5) {
+          const found = await page.pickNextLinks(visited).catch(() => []);
+          if (found.length) queue.push(...found);
+        }
+        let next = queue.shift() || null;
+        if (!next) {
+          const site = this.nextSite();
+          next = site ? site.u : null;
+        }
+        if (!next) {
+          this.logln(C.yellow('  找不到下一个视频，停止'));
+          break;
+        }
+        this.logln(C.dim(`      → 下一个 ${next.slice(0, 96)}`));
+        url = next;
+        await sleep(randInt(400, 1800));
+      }
+    } finally {
+      try { await page.close(); } catch {}
+    }
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1339,7 +1464,10 @@ async function main() {
   }, 1000);
 
   const t0 = Date.now();
-  try { await runner.run(); }
+  try {
+    if (o.videoRoam) await runner.runVideoRoam();
+    else await runner.run();
+  }
   finally {
     if (ticker) clearInterval(ticker);
     if (!o.quiet) process.stdout.write('\r' + ' '.repeat(100) + '\r');
