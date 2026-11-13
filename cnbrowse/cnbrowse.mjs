@@ -348,7 +348,8 @@ class Browser {
       '--no-first-run', '--no-default-browser-check', '--no-service-autorun',
       '--disable-background-networking', '--disable-component-update',
       '--disable-default-apps', '--disable-sync', '--no-pings',
-      '--disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion',
+      '--disable-session-crashed-bubble', '--hide-crash-restore-bubble',
+      '--disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion,InfiniteSessionRestore',
       '--window-size=1512,945',
       '--lang=zh-CN', '--accept-lang=zh-CN,zh;q=0.9,en;q=0.8',
       '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
@@ -383,10 +384,30 @@ class Browser {
   }
 
   async newPage() {
-    const { targetId } = await this.cdp.send('Target.createTarget', { url: 'about:blank' });
+    let targetId = null;
+    // 复用已经存在的页面并关掉多余的，避免把上次会话的标签页带进来
+    await sleep(500);   // 给 Chrome 一点时间把上次会话恢复出来
+    try {
+      const { targetInfos } = await this.cdp.send('Target.getTargets');
+      const pages = targetInfos.filter((t) => t.type === 'page');
+      if (!this._reusedExisting && pages.length) {
+        this._reusedExisting = true;
+        targetId = pages[0].targetId;
+        for (const p of pages.slice(1)) {
+          this.cdp.send('Target.closeTarget', { targetId: p.targetId }).catch(() => {});
+        }
+        await this.cdp.send('Target.activateTarget', { targetId }).catch(() => {});
+      }
+    } catch {}
+    if (!targetId) {
+      const r = await this.cdp.send('Target.createTarget', { url: 'about:blank' });
+      targetId = r.targetId;
+    }
     const { sessionId } = await this.cdp.send('Target.attachToTarget', { targetId, flatten: true });
     const page = new Page(this, targetId, sessionId);
     await page.init();
+    // 先清成空白页，保证不会残留上一次的页面
+    try { await page.navigate('about:blank', 5000); } catch {}
     return page;
   }
 
@@ -793,6 +814,10 @@ class Page {
     const visible = !!(best.best && best.best.vis);
     const ctxId = best.ctxId;
 
+    const wantSound = !!this.b?.opts?.audio;
+    const audioLine = wantSound
+      ? 'v.muted = false; try { v.volume = 1; } catch (e) {}'
+      : 'v.muted = true; v.volume = 0;';
     const startScript = `(async () => {
       const vs = [...document.querySelectorAll('video')];
       if (!vs.length) return { ok: false };
@@ -807,7 +832,7 @@ class Page {
       // 把播放器滚到视口中央，确保人眼能看到画面
       try { v.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
       await new Promise((r) => setTimeout(r, 350));
-      v.muted = true; v.volume = 0;
+      ${audioLine}
       try { v.play(); } catch (e) {}
       if (v.paused) {
         const cands = [...document.querySelectorAll('button,[class*=play],[class*=Play],[aria-label*=播放],[title*=播放]')];
@@ -832,7 +857,7 @@ class Page {
     const limitMs = Math.max(3, maxSeconds) * 1000;
     const t0 = Date.now();
     let lastT = null, advanced = 0, dur = best.vids[0]?.dur || 0;
-    let shotTaken = false, onScreen = null;
+    let shotTaken = false, onScreen = null, mutedState = null;
     while (Date.now() - t0 < limitMs) {
       if (this.crashed) break;
       await sleep(1000);
@@ -852,10 +877,12 @@ class Page {
             if (!v) return null;
             const r = v.getBoundingClientRect();
             return { w: Math.round(r.width), h: Math.round(r.height),
+                     muted: !!v.muted, volume: v.volume,
                      onScreen: r.bottom > 0 && r.top < innerHeight && r.right > 0 &&
                                r.left < innerWidth && r.width > 40 && r.height > 40 };
           })()`, false, 3000, ctxId);
           onScreen = !!(pos && pos.onScreen);
+          mutedState = pos ? !!pos.muted : null;
         } catch { onScreen = null; }
         if (this.b?.opts?.screenshots) {
           await this.screenshot(this.b.opts.screenshots, 'video').catch(() => {});
@@ -867,7 +894,7 @@ class Page {
     return {
       played: advanced >= 1, advanced: Math.round(advanced), seconds: Math.round(secs),
       duration: Math.round(dur), bytes: this.bytes - bytesBefore,
-      visible, onScreen, area: best.best?.area || 0,
+      visible, onScreen, muted: mutedState, area: best.best?.area || 0,
     };
   }
 
@@ -1041,13 +1068,16 @@ const HELP = `
 cnbrowse —— 用真实浏览器随机浏览国内网站，产生与真人上网一致的流量
 
 用法:
-  node cnbrowse.mjs [选项]                  随机浏览（默认不限时长）
-  node cnbrowse.mjs -t 600                  浏览 10 分钟后停止
-  node cnbrowse.mjs -n 200                  浏览满 200 个页面后停止
-  node cnbrowse.mjs -c news,tech            只逛新闻和科技类站点
-  node cnbrowse.mjs --heavy                 只逛图片/媒体多的"高流量"站点
-  node cnbrowse.mjs --sites 京东,淘宝,知乎   指定站点名（支持中文名/域名/分类）
-  node cnbrowse.mjs --list-sites            查看站点池
+  ./cnbrowse                              默认：随机逛全部站点，有视频就播（静音、不开窗口）
+  ./cnbrowse --headed                     同上，但显示浏览器窗口
+  ./cnbrowse --headed --audio             显示窗口 + 开声音
+  ./cnbrowse --video-roam --url <链接>     从某个页面开始连续乱点，跳到哪算哪
+  ./cnbrowse -t 600                      浏览 10 分钟后停止
+  ./cnbrowse -n 200                      浏览满 200 个页面后停止
+  ./cnbrowse -c news,tech                只逛新闻和科技类站点
+  ./cnbrowse --heavy                     只逛图片/媒体多的"高流量"站点
+  ./cnbrowse --sites 京东,淘宝,知乎        指定站点名（支持中文名/域名/分类）
+  ./cnbrowse --list-sites                查看站点池
 
 选项:
   -c, --category <列表>   站点类别，逗号分隔（用 --list-categories 查看）
@@ -1222,6 +1252,7 @@ class Runner {
       this.logln(C.dim(`      ▶ 已播放视频 ${r0.video.advanced}s` +
         `（页面时长 ${r0.video.duration || '直播/?'}s）` +
         ` 播放期间拉流 ${fmtBytes(r0.video.bytes || 0)}` +
+        (this.o.audio && r0.video.muted ? C.yellow('  静音') : '') +
         (r0.video.onScreen === false
           ? C.yellow('  ⚠ 播放器不在视口内（隐藏的预加载/预览）')
           : '')));
@@ -1360,6 +1391,7 @@ class Runner {
         if (r.video && r.video.played) {
           this.logln(C.dim(`      ▶ 已播放 ${r.video.advanced}s` +
             `（页面时长 ${r.video.duration || '直播/?'}s）拉流 ${fmtBytes(r.video.bytes || 0)}` +
+            (this.o.audio && r.video.muted ? C.yellow('  静音（页面播放器强制静音）') : '') +
             (r.video.onScreen === false ? C.yellow('  ⚠ 播放器不在视口内') : '')));
         } else {
           this.logln(C.dim('      （本页没检测到可播放视频）'));
